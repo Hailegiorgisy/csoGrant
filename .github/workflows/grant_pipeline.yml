@@ -6,15 +6,21 @@ on:
     - cron: '0 6 * * *'
   workflow_dispatch: # Allows manual trigger from GitHub UI anytime
 
+concurrency:
+  group: grant-pipeline
+  cancel-in-progress: false
+
 jobs:
   run-grant-pipeline:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Grants write access to commit organization.db back to repo
+      contents: write
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -22,16 +28,66 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
+      - name: Validate Required Secrets
+        run: |
+          set -e
+          errors=0
+          
+          if [ -z "${{ secrets.GEMINI_API_KEY }}" ]; then
+            echo "❌ GEMINI_API_KEY secret is missing"
+            ((errors++))
+          fi
+          
+          if [ -z "${{ secrets.SMTP_SERVER }}" ]; then
+            echo "❌ SMTP_SERVER secret is missing"
+            ((errors++))
+          fi
+          
+          if [ -z "${{ secrets.SMTP_PORT }}" ]; then
+            echo "❌ SMTP_PORT secret is missing"
+            ((errors++))
+          fi
+          
+          if [ -z "${{ secrets.SMTP_EMAIL }}" ]; then
+            echo "❌ SMTP_EMAIL secret is missing"
+            ((errors++))
+          fi
+          
+          if [ -z "${{ secrets.SMTP_PASSWORD }}" ]; then
+            echo "❌ SMTP_PASSWORD secret is missing"
+            ((errors++))
+          fi
+          
+          if [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ]; then
+            echo "❌ TELEGRAM_BOT_TOKEN secret is missing"
+            ((errors++))
+          fi
+          
+          if [ $errors -gt 0 ]; then
+            echo "❌ $errors required secret(s) missing. Please configure them in repository settings."
+            exit 1
+          fi
+          
+          echo "✅ All required secrets are configured"
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run Database & NGO Profile Setup
-        run: python db_config.py
+        run: |
+          set -e
+          echo "Starting database configuration..."
+          python db_config.py
+          echo "✅ Database configuration completed"
 
       - name: Run Multi-Source Grant Scrapers
-        run: python multi_source_scraper.py
+        run: |
+          set -e
+          echo "Starting grant scraping..."
+          python multi_source_scraper.py
+          echo "✅ Grant scraping completed"
 
       - name: Run Gemini AI Evaluation & Notifications
         env:
@@ -41,14 +97,43 @@ jobs:
           SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        run: python ai_notifier_engine.py
-
-      - name: Commit & Push Updated SQLite Database Artifacts
-        permissions:
-          contents: write
         run: |
+          set -e
+          echo "Starting AI evaluation and notifications..."
+          python ai_notifier_engine.py
+          echo "✅ AI evaluation and notifications completed"
+
+      - name: Check for Database Changes
+        id: check_changes
+        run: |
+          if git diff --quiet organization.db; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "ℹ️  No changes to commit"
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "✅ Database changes detected"
+          fi
+
+      - name: Commit & Push Updated SQLite Database
+        if: steps.check_changes.outputs.changed == 'true'
+        run: |
+          set -e
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add organization.db
-          git commit -m "auto: update grant database [skip ci]" || exit 0
-          git push
+          git commit -m "auto: update grant database [skip ci]"
+          
+          # Pull latest changes and rebase to avoid conflicts
+          git pull --rebase origin ${{ github.ref_name }}
+          
+          git push origin ${{ github.ref_name }}
+          echo "✅ Database successfully committed and pushed"
+
+      - name: Workflow Summary
+        if: always()
+        run: |
+          echo "## NGO Grant Pipeline Execution Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Run ID:** ${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Triggered by:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
