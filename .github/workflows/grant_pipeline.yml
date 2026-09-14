@@ -42,9 +42,9 @@ jobs:
         run: python ai_notifier_engine.py
 
       - name: Commit & Push Updated SQLite Database Artifacts
-        permissions:
-          contents: write
-        run: |
+      permissions:
+        contents: write
+      run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add organization.db
