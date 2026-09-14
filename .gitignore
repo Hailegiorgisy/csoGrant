@@ -1,0 +1,15 @@
+# Local Database & Secrets
+*.db
+*.sqlite3
+.env
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment & IDE
+.venv/
+env/
+.vscode/
+.idea/
