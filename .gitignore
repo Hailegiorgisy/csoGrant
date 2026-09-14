@@ -1,5 +1,4 @@
 # Local Database & Secrets
-*.db
 *.sqlite3
 .env
 
