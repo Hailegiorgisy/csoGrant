@@ -22,20 +22,23 @@ THEMATIC_KEYWORDS = [
 ]
 
 GEO_KEYWORDS = ["ethiopia", "east africa", "africa", "sub-saharan"]
-
-# Opportunity categories
 OPPORTUNITY_TYPES = ["grant", "funding", "call for proposals", "conference", "seminar", "fellowship", "training"]
 
 # ================= State Persistence & Deduplication =================
+def init_seen_db():
+    """Guarantees that seen_opportunities.json exists immediately upon startup."""
+    if not os.path.exists(SEEN_DB_FILE):
+        with open(SEEN_DB_FILE, "w", encoding="utf-8") as f:
+            json.dump({"seen_ids": [], "updated_at": datetime.datetime.utcnow().isoformat()}, f, indent=2)
+
 def load_seen_ids() -> set:
-    if os.path.exists(SEEN_DB_FILE):
-        try:
-            with open(SEEN_DB_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return set(data.get("seen_ids", []))
-        except Exception:
-            return set()
-    return set()
+    init_seen_db()
+    try:
+        with open(SEEN_DB_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return set(data.get("seen_ids", []))
+    except Exception:
+        return set()
 
 def save_seen_id(opp_id: str):
     seen = load_seen_ids()
@@ -43,9 +46,9 @@ def save_seen_id(opp_id: str):
     with open(SEEN_DB_FILE, "w", encoding="utf-8") as f:
         json.dump({"seen_ids": list(seen), "updated_at": datetime.datetime.utcnow().isoformat()}, f, indent=2)
 
-# ================= Scraping & Opportunity Ingestion =================
+# ================= Scraping & Ingestion =================
 def fetch_reliefweb_records() -> List[Dict[str, Any]]:
-    """Ingests calls, reports, training sessions, and announcements from ReliefWeb."""
+    """Ingests announcements, training calls, and reports from ReliefWeb API."""
     topics_query = " OR ".join(f'"{kw}"' for kw in THEMATIC_KEYWORDS[:8])
     geo_query = "Ethiopia OR Africa"
     
@@ -88,7 +91,6 @@ def fetch_reliefweb_records() -> List[Dict[str, Any]]:
     return records
 
 def parse_deadline(text: str) -> Optional[datetime.datetime]:
-    """Attempts to identify dates near deadline keywords."""
     patterns = [
         r'(?:deadline|closing date|due date|apply before|submissions close)[:\s]+([A-Za-z]+ \d{1,2},? \d{4})',
         r'(?:deadline|closing date|due date)[:\s]+(\d{4}-\d{2}-\d{2})'
@@ -105,7 +107,6 @@ def parse_deadline(text: str) -> Optional[datetime.datetime]:
     return None
 
 def filter_opportunities(records: List[Dict[str, Any]], seen_ids: set) -> List[Dict[str, Any]]:
-    """Enforces thematic match, geography, deadline threshold, and deduplication."""
     qualified = []
     now = datetime.datetime.utcnow()
 
@@ -115,26 +116,22 @@ def filter_opportunities(records: List[Dict[str, Any]], seen_ids: set) -> List[D
 
         text_content = f"{item['title']} {item['description']}".lower()
 
-        # Check topic match (at least one key topic)
         has_topic = any(kw in text_content for kw in THEMATIC_KEYWORDS)
-        # Check geographic alignment
         has_geo = any(geo in text_content for geo in GEO_KEYWORDS)
 
         if not (has_topic and has_geo):
             continue
 
-        # Deadline evaluation: ensure window has at least 24-48 hours
         deadline_dt = parse_deadline(text_content)
         if deadline_dt:
             hours_left = (deadline_dt - now).total_seconds() / 3600
             if hours_left < 24:
-                # Omit expired or immediately closing opportunities (< 24h)
+                # Skip if less than 24 hours remain
                 continue
             item["parsed_deadline"] = deadline_dt.strftime("%Y-%m-%d")
         else:
-            item["parsed_deadline"] = "Rolling / Not specified (Verify on site)"
+            item["parsed_deadline"] = "Rolling / Not specified"
 
-        # Detect opportunity category
         detected_category = "Grant / Funding Call"
         for cat in OPPORTUNITY_TYPES:
             if cat in text_content:
@@ -146,12 +143,8 @@ def filter_opportunities(records: List[Dict[str, Any]], seen_ids: set) -> List[D
 
     return qualified
 
-# ================= Proposal & Application Letter Generator =================
+# ================= Application Letter & Proposal Generator =================
 def generate_ease_africa_package(opp: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Constructs an application letter and a targeted concept proposal tailored
-    specifically for Ease Africa as an emerging local CSO.
-    """
     title = opp["title"]
     category = opp["category"]
 
@@ -159,93 +152,85 @@ def generate_ease_africa_package(opp: Dict[str, Any]) -> Dict[str, str]:
         f"Subject: Expression of Interest / Application: {title}\n\n"
         f"Dear Selection Committee,\n\n"
         f"On behalf of Ease Africa, a civil society organization headquartered in Addis Ababa, Ethiopia, "
-        f"we are pleased to submit our application for the '{title}'.\n\n"
-        f"Who We Are:\n"
-        f"Ease Africa operates at the intersection of public health and modern technology. Our core mandate "
-        f"is to deploy data-driven, community-anchored interventions that address high-burden health challenges—"
+        f"we are pleased to submit our application for '{title}'.\n\n"
+        f"About Ease Africa:\n"
+        f"Ease Africa operates at the nexus of public health and modern technology. Our mission is to deploy "
+        f"data-driven, community-centered solutions addressing high-burden conditions across Ethiopia and East Africa, "
         f"including Tuberculosis (TB), Malaria, HIV, Neglected Tropical Diseases (NTDs), Non-Communicable Diseases (NCDs), "
         f"and Maternal & Child Health (MCH).\n\n"
         f"Why Partner with an Emerging CSO:\n"
-        f"While Ease Africa is an agile and emerging organization, our team combines robust clinical acumen, "
-        f"epidemiological research background, and full-stack health informatics capability. Being community-based, "
-        f"we offer deep local access, cultural fluency, and rapid on-the-ground operational deployment across Ethiopia "
-        f"and regional hubs.\n\n"
-        f"Alignment with This Opportunity:\n"
-        f"This {category.lower()} represents an essential strategic fit with our vision to bridge healthcare delivery "
-        f"gaps using digital health tools and targeted community surveillance.\n\n"
-        f"We welcome the opportunity to discuss our implementation plan in further detail.\n\n"
-        f"Warm regards,\n"
-        f"Executive Leadership & Programs Team\n"
+        f"While Ease Africa is an emerging organization, our team possesses established clinical, epidemiological, "
+        f"and health informatics expertise. We offer grassroots agility, local cultural fluency, and direct community "
+        f"engagement mechanisms that ensure accountable and transparent project delivery.\n\n"
+        f"Alignment with This Call:\n"
+        f"This {category.lower()} directly supports our strategic goal to improve healthcare access and primary health "
+        f"data reporting in resource-constrained catchment areas.\n\n"
+        f"Sincerely,\n"
+        f"Programs & Research Team\n"
         f"Ease Africa | Addis Ababa, Ethiopia"
     )
 
     proposal = (
-        f"# Project Concept Note: Digital Health & Community Health Systems Strengthening\n"
+        f"# Project Concept Note: Strengthening Health Systems Through Digital Innovation\n"
         f"Organization: Ease Africa (Addis Ababa, Ethiopia)\n"
         f"Target Opportunity: {title}\n"
         f"Category: {category}\n\n"
         f"1. Executive Summary\n"
-        f"Ease Africa proposes a collaborative, high-impact initiative designed to enhance local primary healthcare "
-        f"and epidemiological surveillance in target catchment areas. Leveraging lightweight digital health workflows "
-        f"and community health worker training, this project bridges facility-level care with community outreach.\n\n"
+        f"Ease Africa proposes an initiative integrating community-level active case finding with lightweight "
+        f"digital tracking tools to improve diagnosis, referral, and treatment adherence in target Ethiopian communities.\n\n"
         f"2. Problem Statement\n"
-        f"In underserved communities across Ethiopia and East Africa, timely case identification, referral tracking, "
-        f"and retention in care for priority conditions (TB, Malaria, MCH, and chronic NCDs) remain constrained by "
-        f"paper-based data silos and limited digital infrastructure.\n\n"
-        f"3. Proposed Project Objectives\n"
-        f"• Objective 1: Deploy community-level screening and active case-finding tools in collaboration with local health bureaus.\n"
-        f"• Objective 2: Establish data pipeline integration for real-time tracking, risk stratification, and patient follow-up.\n"
-        f"• Objective 3: Strengthen frontline health worker capacity through structured digital training modules.\n\n"
-        f"4. Organizational Capacity & Risk Mitigation (Emerging CSO Track)\n"
-        f"• Agility: Direct, unbureaucratic community access and established grassroots trust.\n"
-        f"• Technical Bench: In-house technical leadership across public health, clinical medicine, and software development.\n"
-        f"• Accountability: Transparent financial controls, milestones tracking, and alignment with regional health guidelines.\n\n"
-        f"5. Expected Outcomes & Sustainability\n"
-        f"• Improved screening throughput and reduced diagnostic delays.\n"
-        f"• Transition of workflows to woreda health offices for institutional longevity."
+        f"Frontline primary healthcare facilities frequently face reporting lags, fragmented records, and limited "
+        f"follow-up systems for priority diseases (TB, Malaria, MCH, NCDs), resulting in preventable morbidity.\n\n"
+        f"3. Core Objectives\n"
+        f"• Objective 1: Implement community-based screening protocols with woreda health offices.\n"
+        f"• Objective 2: Utilize mobile/digital registries for real-time monitoring and patient tracing.\n"
+        f"• Objective 3: Build frontline community health worker capacity via structured digital training modules.\n\n"
+        f"4. Organizational Strengths (Emerging CSO Track)\n"
+        f"• Deep community presence and grassroots stakeholder alignment.\n"
+        f"• Interdisciplinary technical capacity spanning clinical medicine, data science, and public health.\n"
+        f"• Lean, transparent project management and auditable milestones.\n\n"
+        f"5. Sustainability Plan\n"
+        f"Integration of reporting tools into regional health structures to maintain continuity beyond the grant lifecycle."
     )
 
     return {"letter": letter, "proposal": proposal}
 
 # ================= Dispatch Handlers =================
 def send_telegram_alert(bot_token: str, chat_id: str, opp: Dict[str, Any], package: Dict[str, str]):
-    """Sends a summary notification to the Telegram Group, split into chunks if needed."""
     if not bot_token or not chat_id:
         return
 
-    # Message 1: Opportunity Alert Overview
     summary_msg = (
         f"🚨 *EASE AFRICA — Daily Opportunity Alert*\n\n"
         f"📌 *Title:* {opp['title']}\n"
-        f"🏷 *Type:* {opp['category']}\n"
+        f"🏷 *Category:* {opp['category']}\n"
         f"🏢 *Source:* {opp['source']}\n"
         f"⏳ *Deadline:* {opp['parsed_deadline']}\n"
         f"🔗 [View Official Announcement]({opp['url']})\n\n"
-        f"📄 *Application letter and concept proposal have been generated below.*"
+        f"📄 *Application letter and concept proposal prepared below.*"
     )
-    
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    requests.post(url, json={"chat_id": chat_id, "text": summary_msg, "parse_mode": "Markdown"}, timeout=15)
+    try:
+        requests.post(url, json={"chat_id": chat_id, "text": summary_msg, "parse_mode": "Markdown"}, timeout=15)
+        
+        doc_msg = (
+            f"📝 *Ease Africa — Application Letter:*\n```\n{package['letter']}\n```\n\n"
+            f"📑 *Concept Proposal Outline:*\n```\n{package['proposal']}\n```"
+        )
+        if len(doc_msg) > 4000:
+            doc_msg = doc_msg[:3950] + "\n...[truncated for Telegram]"
+        requests.post(url, json={"chat_id": chat_id, "text": doc_msg, "parse_mode": "Markdown"}, timeout=15)
+    except Exception as e:
+        print(f"Error sending Telegram alert: {e}")
 
-    # Message 2: Draft Application Letter & Proposal (Truncated to fit Telegram's 4096 char limit)
-    doc_msg = (
-        f"📝 *Ease Africa — Application Letter:*\n```\n{package['letter']}\n```\n\n"
-        f"📑 *Concept Proposal Outline:*\n```\n{package['proposal']}\n```"
-    )
-    if len(doc_msg) > 4000:
-        doc_msg = doc_msg[:3950] + "\n...[truncated for Telegram]"
-    
-    requests.post(url, json={"chat_id": chat_id, "text": doc_msg, "parse_mode": "Markdown"}, timeout=15)
-
-def send_optional_email(smtp_user: str, smtp_pass: str, to_email: str, opp: Dict[str, Any], package: Dict[str, str]):
-    """Sends full HTML email if SMTP credentials are provided in secrets."""
-    if not (smtp_user and smtp_pass and to_email):
+def send_optional_email(smtp_user: str, smtp_pass: str, to_emails: List[str], opp: Dict[str, Any], package: Dict[str, str]):
+    if not (smtp_user and smtp_pass and to_emails):
         return
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"[Ease Africa Alert] {opp['category']}: {opp['title']}"
     msg["From"] = smtp_user
-    msg["To"] = to_email
+    msg["To"] = ", ".join(to_emails)
 
     html_content = f"""
     <html>
@@ -269,17 +254,22 @@ def send_optional_email(smtp_user: str, smtp_pass: str, to_email: str, opp: Dict
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(smtp_user, smtp_pass)
-            server.sendmail(smtp_user, [to_email], msg.as_string())
+            server.sendmail(smtp_user, to_emails, msg.as_string())
+        print(f"Email successfully sent to {len(to_emails)} recipient(s).")
     except Exception as e:
         print(f"Error dispatching email: {e}")
 
 # ================= Main Routine =================
 def run():
+    init_seen_db()
+
     tg_token = os.getenv("TELEGRAM_BOT_TOKEN")
     tg_chat_id = os.getenv("TELEGRAM_GROUP_CHAT_ID")
     smtp_user = os.getenv("SMTP_USER")
     smtp_pass = os.getenv("SMTP_APP_PASSWORD")
-    recipient_email = os.getenv("RECIPIENT_EMAIL")
+    
+    raw_emails = os.getenv("RECIPIENT_EMAILS") or os.getenv("RECIPIENT_EMAIL", "")
+    recipient_emails = [e.strip() for e in raw_emails.split(",") if e.strip()]
 
     seen_ids = load_seen_ids()
     records = fetch_reliefweb_records()
@@ -290,13 +280,13 @@ def run():
     for opp in qualified:
         package = generate_ease_africa_package(opp)
         
-        # Send to Telegram Group
+        # Dispatch to Telegram Group
         send_telegram_alert(tg_token, tg_chat_id, opp, package)
         
-        # Optional Email dispatch
-        send_optional_email(smtp_user, smtp_pass, recipient_email, opp, package)
+        # Dispatch to multiple email recipients
+        send_optional_email(smtp_user, smtp_pass, recipient_emails, opp, package)
         
-        # Persist ID to prevent repeating tomorrow
+        # Save ID to prevent duplicates
         save_seen_id(opp["id"])
 
 if __name__ == "__main__":
