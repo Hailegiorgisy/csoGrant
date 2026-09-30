@@ -2,15 +2,15 @@ name: Ease Africa Opportunity & Grant Agent
 
 on:
   schedule:
-    # 04:30 UTC = 07:30 AM EAT (Addis Ababa time)
+    # 04:30 UTC = 07:30 AM East Africa Time (Addis Ababa)
     - cron: '30 4 * * *'
-  workflow_dispatch: # Allows manual trigger from the GitHub Actions UI
+  workflow_dispatch:
 
 jobs:
   run-grant-agent:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Needed to commit seen_opportunities.json back to repo
+      contents: write
 
     steps:
       - name: Checkout Code
@@ -32,12 +32,16 @@ jobs:
           TELEGRAM_GROUP_CHAT_ID: ${{ secrets.TELEGRAM_GROUP_CHAT_ID }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
-          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          RECIPIENT_EMAILS: ${{ secrets.RECIPIENT_EMAILS }}
         run: python grant_agent.py
 
       - name: Commit & Push Updated History
         run: |
-          git config --global user.name "Ease Africa Grant Bot"
-          git config --global user.email "bot@easeafrica.local"
-          git add seen_opportunities.json
-          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: update seen opportunities [skip ci]" && git push)
+          if [ -f seen_opportunities.json ]; then
+            git config --global user.name "Ease Africa Grant Bot"
+            git config --global user.email "bot@easeafrica.local"
+            git add seen_opportunities.json
+            git diff --quiet && git diff --staged --quiet || (git commit -m "chore: update seen opportunities [skip ci]" && git push)
+          else
+            echo "seen_opportunities.json not found. Skipping commit."
+          fi
