@@ -2,31 +2,42 @@ import os
 import json
 import re
 import datetime
+import xml.etree.ElementTree as ET
+from typing import List, Dict, Any, Optional
 import requests
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import List, Dict, Any, Optional
 
 # ================= Configuration =================
 SEEN_DB_FILE = "seen_opportunities.json"
-RELIEFWEB_API_URL = "https://api.reliefweb.int/v1/reports"
 
-# Core focus topics for Ease Africa
+# Common browser User-Agent so RSS endpoints do not block the GitHub Action runner
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8"
+}
+
+# Thematic focus areas for Ease Africa
 THEMATIC_KEYWORDS = [
     "health", "public health", "digital health", "technology", "tech",
     "data science", "artificial intelligence", "ai", "machine learning",
-    "tb", "tuberculosis", "malaria", "hiv", "aids", "ntd",
-    "neglected tropical", "ncd", "non-communicable", "mch",
-    "maternal", "child health", "epidemiology", "informatics"
+    "tb", "tuberculosis", "malaria", "hiv", "aids", "ntd", "neglected tropical",
+    "ncd", "non-communicable", "mch", "maternal", "child health",
+    "epidemiology", "informatics", "surveillance", "telemedicine", "community health"
 ]
 
-GEO_KEYWORDS = ["ethiopia", "east africa", "africa", "sub-saharan"]
-OPPORTUNITY_TYPES = ["grant", "funding", "call for proposals", "conference", "seminar", "fellowship", "training"]
+# Geographic eligibility (includes broad regional and LMIC terms)
+GEO_KEYWORDS = [
+    "ethiopia", "east africa", "eastern africa", "africa", "sub-saharan",
+    "lmic", "low- and middle-income", "developing countries", "global south",
+    "all countries", "worldwide", "global"
+]
+
+OPPORTUNITY_TYPES = ["grant", "funding", "call for proposals", "conference", "seminar", "fellowship", "training", "award"]
 
 # ================= State Persistence & Deduplication =================
 def init_seen_db():
-    """Guarantees that seen_opportunities.json exists immediately upon startup."""
     if not os.path.exists(SEEN_DB_FILE):
         with open(SEEN_DB_FILE, "w", encoding="utf-8") as f:
             json.dump({"seen_ids": [], "updated_at": datetime.datetime.utcnow().isoformat()}, f, indent=2)
@@ -46,98 +57,170 @@ def save_seen_id(opp_id: str):
     with open(SEEN_DB_FILE, "w", encoding="utf-8") as f:
         json.dump({"seen_ids": list(seen), "updated_at": datetime.datetime.utcnow().isoformat()}, f, indent=2)
 
-# ================= Scraping & Ingestion =================
-def fetch_reliefweb_records() -> List[Dict[str, Any]]:
-    """Ingests announcements, training calls, and reports from ReliefWeb API."""
-    topics_query = " OR ".join(f'"{kw}"' for kw in THEMATIC_KEYWORDS[:8])
-    geo_query = "Ethiopia OR Africa"
-    
+# ================= Multi-Source Opportunity Scrapers =================
+
+def fetch_rss_feed(url: str, source_name: str) -> List[Dict[str, Any]]:
+    """Generic XML parser for standard RSS and Atom feeds."""
+    items = []
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=20)
+        res.raise_for_status()
+        root = ET.fromstring(res.content)
+
+        # Standard RSS 2.0 channel/item
+        channel = root.find("channel")
+        elements = channel.findall("item") if channel is not None else root.findall(".//item")
+        
+        # If Atom feed (feed/entry)
+        if not elements:
+            elements = root.findall(".//{http://www.w3.org/2005/Atom}entry")
+
+        for el in elements:
+            title = el.findtext("title") or el.findtext("{http://www.w3.org/2005/Atom}title") or "Untitled"
+            link = el.findtext("link") or el.findtext("{http://www.w3.org/2005/Atom}link") or ""
+            desc = el.findtext("description") or el.findtext("{http://www.w3.org/2005/Atom}summary") or ""
+            guid = el.findtext("guid") or el.findtext("{http://www.w3.org/2005/Atom}id") or link
+
+            # Strip HTML tags from description snippet
+            clean_desc = re.sub(r'<[^>]+>', ' ', desc).strip()[:2000]
+
+            if link:
+                items.append({
+                    "id": guid.strip(),
+                    "title": title.strip(),
+                    "url": link.strip(),
+                    "description": clean_desc,
+                    "source": source_name
+                })
+        print(f"[{source_name}] Retrieved {len(items)} raw listings.")
+    except Exception as e:
+        print(f"[{source_name}] Ingestion error: {e}")
+    return items
+
+def fetch_grants_gov_opportunities() -> List[Dict[str, Any]]:
+    """Queries Grants.gov Search2 open public API for global health grants."""
+    items = []
+    endpoint = "https://api.grants.gov/v1/api/search2"
+    payload = {
+        "fundingCategories": "HL", # Health category
+        "oppStatuses": "posted",
+        "keywords": "health Africa"
+    }
+    try:
+        res = requests.post(endpoint, json=payload, headers=HEADERS, timeout=20)
+        if res.status_code == 200:
+            data = res.json()
+            opp_list = data.get("oppHits", []) or data.get("opportunities", [])
+            for opp in opp_list:
+                opp_id = str(opp.get("id") or opp.get("opportunityNumber") or opp.get("number"))
+                title = opp.get("title") or opp.get("opportunityTitle") or "Federal Grant Opportunity"
+                link = f"https://www.grants.gov/search-results-detail/{opp_id}"
+                desc = opp.get("synopsis") or opp.get("agencyName") or ""
+                close_date = opp.get("closeDate") or ""
+                items.append({
+                    "id": f"grantsgov_{opp_id}",
+                    "title": title,
+                    "url": link,
+                    "description": f"Agency: {opp.get('agencyName', '')}. Description: {desc}",
+                    "source": "Grants.gov (Global Health / USAID / CDC)",
+                    "raw_deadline": close_date
+                })
+            print(f"[Grants.gov] Retrieved {len(items)} opportunities.")
+    except Exception as e:
+        print(f"[Grants.gov] Query error: {e}")
+    return items
+
+def fetch_reliefweb_training() -> List[Dict[str, Any]]:
+    """Queries ReliefWeb training API for health seminars and conferences."""
+    items = []
+    endpoint = "https://api.reliefweb.int/v1/training"
     payload = {
         "appname": "ease_africa_agent",
-        "query": {
-            "value": f"({topics_query}) AND ({geo_query})"
-        },
-        "filter": {
-            "operator": "AND",
-            "conditions": [
-                {
-                    "field": "format.name",
-                    "value": ["Training", "Job", "Manual and Guideline", "Other"],
-                    "operator": "OR"
-                }
-            ]
-        },
-        "limit": 20,
-        "fields": {"include": ["title", "body", "url", "date", "source"]}
+        "query": {"value": "health AND (Africa OR Ethiopia)"},
+        "limit": 15,
+        "fields": {"include": ["title", "body", "url", "source", "date"]}
     }
-    
-    records = []
     try:
-        res = requests.post(RELIEFWEB_API_URL, json=payload, timeout=20)
-        res.raise_for_status()
-        data = res.json()
-        for item in data.get("data", []):
-            f = item.get("fields", {})
-            records.append({
-                "id": str(item.get("id")),
-                "title": f.get("title", "Untitled Opportunity"),
-                "url": f.get("url", ""),
-                "description": f.get("body", "")[:2500],
-                "source": f.get("source", [{}])[0].get("name", "ReliefWeb / Global Partner"),
-                "date_published": f.get("date", {}).get("created", "")
-            })
+        res = requests.post(endpoint, json=payload, headers=HEADERS, timeout=20)
+        if res.status_code == 200:
+            for item in res.json().get("data", []):
+                f = item.get("fields", {})
+                items.append({
+                    "id": f"rw_{item.get('id')}",
+                    "title": f.get("title", ""),
+                    "url": f.get("url", ""),
+                    "description": f.get("body", "")[:2000],
+                    "source": "ReliefWeb Training & Conferences"
+                })
+            print(f"[ReliefWeb Training] Retrieved {len(items)} training/seminar listings.")
     except Exception as e:
-        print(f"Error querying ReliefWeb: {e}")
-    return records
+        print(f"[ReliefWeb Training] Query error: {e}")
+    return items
 
+# ================= Date Parsing & Filtering =================
 def parse_deadline(text: str) -> Optional[datetime.datetime]:
     patterns = [
         r'(?:deadline|closing date|due date|apply before|submissions close)[:\s]+([A-Za-z]+ \d{1,2},? \d{4})',
-        r'(?:deadline|closing date|due date)[:\s]+(\d{4}-\d{2}-\d{2})'
+        r'(?:deadline|closing date|due date)[:\s]+(\d{4}-\d{2}-\d{2})',
+        r'(?:deadline|closing date)[:\s]+(\d{1,2}/\d{1,2}/\d{4})'
     ]
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             date_str = match.group(1).replace(",", "")
-            for fmt in ("%B %d %Y", "%b %d %Y", "%Y-%m-%d"):
+            for fmt in ("%B %d %Y", "%b %d %Y", "%Y-%m-%d", "%m/%d/%Y"):
                 try:
                     return datetime.datetime.strptime(date_str, fmt)
                 except ValueError:
                     continue
     return None
 
-def filter_opportunities(records: List[Dict[str, Any]], seen_ids: set) -> List[Dict[str, Any]]:
+def filter_and_rank_opportunities(all_items: List[Dict[str, Any]], seen_ids: set) -> List[Dict[str, Any]]:
     qualified = []
     now = datetime.datetime.utcnow()
 
-    for item in records:
+    for item in all_items:
         if item["id"] in seen_ids:
             continue
 
         text_content = f"{item['title']} {item['description']}".lower()
 
+        # Check topic relevance
         has_topic = any(kw in text_content for kw in THEMATIC_KEYWORDS)
-        has_geo = any(geo in text_content for geo in GEO_KEYWORDS)
-
-        if not (has_topic and has_geo):
+        if not has_topic:
             continue
 
+        # Check geographic eligibility
+        has_geo = any(geo in text_content for geo in GEO_KEYWORDS)
+        # If source is FundsforNGOs or OpportunityDesk, geographic focus is already pre-filtered for development
+        if not has_geo and "fundsforngos" not in item["source"].lower():
+            continue
+
+        # Evaluate deadline: must have at least 24-48 hours remaining
         deadline_dt = parse_deadline(text_content)
+        if not deadline_dt and item.get("raw_deadline"):
+            for fmt in ("%m/%d/%Y", "%Y-%m-%d"):
+                try:
+                    deadline_dt = datetime.datetime.strptime(item["raw_deadline"], fmt)
+                    break
+                except ValueError:
+                    pass
+
         if deadline_dt:
             hours_left = (deadline_dt - now).total_seconds() / 3600
             if hours_left < 24:
-                # Skip if less than 24 hours remain
                 continue
             item["parsed_deadline"] = deadline_dt.strftime("%Y-%m-%d")
         else:
-            item["parsed_deadline"] = "Rolling / Not specified"
+            item["parsed_deadline"] = "Rolling / Verify on website"
 
-        detected_category = "Grant / Funding Call"
-        for cat in OPPORTUNITY_TYPES:
-            if cat in text_content:
-                detected_category = cat.title()
+        # Categorize
+        category = "Grant / Funding Opportunity"
+        for t in OPPORTUNITY_TYPES:
+            if t in text_content:
+                category = t.title()
                 break
-        item["category"] = detected_category
+        item["category"] = category
 
         qualified.append(item)
 
@@ -267,26 +350,35 @@ def run():
     tg_chat_id = os.getenv("TELEGRAM_GROUP_CHAT_ID")
     smtp_user = os.getenv("SMTP_USER")
     smtp_pass = os.getenv("SMTP_APP_PASSWORD")
-    
+
     raw_emails = os.getenv("RECIPIENT_EMAILS") or os.getenv("RECIPIENT_EMAIL", "")
     recipient_emails = [e.strip() for e in raw_emails.split(",") if e.strip()]
 
     seen_ids = load_seen_ids()
-    records = fetch_reliefweb_records()
-    qualified = filter_opportunities(records, seen_ids)
 
-    print(f"Found {len(qualified)} new matching opportunities for Ease Africa.")
+    # Aggregate across all 5 sources
+    all_raw_items = []
+    all_raw_items.extend(fetch_rss_feed("https://www.fundsforngos.org/feed/", "FundsforNGOs"))
+    all_raw_items.extend(fetch_rss_feed("https://opportunitydesk.org/feed/", "Opportunity Desk"))
+    all_raw_items.extend(fetch_rss_feed("https://philanthropynewsdigest.org/rfps/rss", "Philanthropy News Digest"))
+    all_raw_items.extend(fetch_grants_gov_opportunities())
+    all_raw_items.extend(fetch_reliefweb_training())
+
+    print(f"Total raw opportunities ingested across sources: {len(all_raw_items)}")
+
+    qualified = filter_and_rank_opportunities(all_raw_items, seen_ids)
+    print(f"Found {len(qualified)} matching opportunities meeting Ease Africa criteria.")
 
     for opp in qualified:
         package = generate_ease_africa_package(opp)
-        
+
         # Dispatch to Telegram Group
         send_telegram_alert(tg_token, tg_chat_id, opp, package)
-        
-        # Dispatch to multiple email recipients
+
+        # Dispatch to email list if configured
         send_optional_email(smtp_user, smtp_pass, recipient_emails, opp, package)
-        
-        # Save ID to prevent duplicates
+
+        # Save ID to avoid repeating tomorrow
         save_seen_id(opp["id"])
 
 if __name__ == "__main__":
